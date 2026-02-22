@@ -44,9 +44,13 @@ MOCK_ITEMS = [
     {"rfid_tag": "RFID-MUL-002", "item_id": "item-6", "name": "Multimeter #2", "status": "AVAILABLE", "holder_id": None},
 ]
 
-# Initialize cache
+# Initialize cache with full data (including item_id and name)
 for item in MOCK_ITEMS:
-    db.update_item_state(item["rfid_tag"], item["status"], item["holder_id"])
+    db._conn.execute('''
+        INSERT OR REPLACE INTO item_cache (rfid_tag, item_id, name, status, holder_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (item["rfid_tag"], item["item_id"], item["name"], item["status"], item["holder_id"], datetime.now()))
+db._conn.commit()
 
 # Mock cards
 MOCK_CARDS = {

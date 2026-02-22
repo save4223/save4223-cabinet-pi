@@ -323,12 +323,22 @@ class LocalDB:
             ''', (card_uid, user_id, session_id, json.dumps(tags_found or [])))
     
     def update_item_state(self, rfid_tag: str, status: str, holder_id: Optional[str]):
-        """Update cached item state."""
+        """Update cached item state. Only updates if item exists."""
         with self._conn:
-            self._conn.execute('''
-                INSERT OR REPLACE INTO item_cache (rfid_tag, status, holder_id, updated_at)
-                VALUES (?, ?, ?, ?)
-            ''', (rfid_tag, status, holder_id, datetime.now()))
+            # Check if item exists first
+            existing = self._conn.execute(
+                'SELECT 1 FROM item_cache WHERE rfid_tag = ?', (rfid_tag,)
+            ).fetchone()
+            
+            if existing:
+                # Update existing item
+                self._conn.execute('''
+                    UPDATE item_cache 
+                    SET status = ?, holder_id = ?, updated_at = ?
+                    WHERE rfid_tag = ?
+                ''', (status, holder_id, datetime.now(), rfid_tag))
+            # If not exists, don't insert (item_id and name would be NULL)
+            # The item should be populated via local_sync or initial seed
     
     def get_item_cache(self, rfid_tag: str) -> Optional[Dict[str, Any]]:
         """Get cached item info."""
