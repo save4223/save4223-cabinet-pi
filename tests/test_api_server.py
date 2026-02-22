@@ -84,6 +84,25 @@ class TestAPIHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         """Handle GET requests."""
+        # Serve static files (test-panel.html)
+        if self.path == '/' or self.path == '/test-panel.html':
+            try:
+                display_dir = Path(__file__).parent.parent / "display"
+                html_file = display_dir / "test-panel.html"
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                with open(html_file, 'rb') as f:
+                    self.wfile.write(f.read())
+                return
+            except Exception as e:
+                self._set_headers(500)
+                self.wfile.write(json.dumps({"error": f"Failed to load HTML: {str(e)}"}).encode())
+                return
+        
         self._set_headers()
         
         if self.path == '/api/state':
@@ -311,10 +330,10 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": "Not found"}).encode())
 
 
-def run_test_server(port=8765):
+def run_test_server(port=8765, host='0.0.0.0'):
     """Run the test API server."""
-    server = HTTPServer(('localhost', port), TestAPIHandler)
-    logger.info(f"🚀 Test API Server running on http://localhost:{port}")
+    server = HTTPServer((host, port), TestAPIHandler)
+    logger.info(f"🚀 Test API Server running on http://{host}:{port}")
     logger.info(f"")
     logger.info(f"Endpoints:")
     logger.info(f"  GET  /api/state              - Get current system state")
