@@ -52,6 +52,17 @@ for item in MOCK_ITEMS:
     ''', (item["rfid_tag"], item["item_id"], item["name"], item["status"], item["holder_id"], datetime.now()))
 db._conn.commit()
 
+# Create initial baseline snapshot for diff calculation
+initial_session = "initial-baseline"
+initial_tags = [item["rfid_tag"] for item in MOCK_ITEMS]
+for tag in initial_tags:
+    db._conn.execute('''
+        INSERT INTO rfid_snapshots (session_id, cabinet_id, rfid_tag, present, captured_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (initial_session, 1, tag, True, datetime.now()))
+db._conn.commit()
+logger.info(f"✅ Created initial baseline snapshot with {len(initial_tags)} items")
+
 # Mock cards
 MOCK_CARDS = {
     "TEST123": {"user_id": "550e8400-e29b-41d4-a716-446655440000", "user_name": "Test User", "email": "test@example.com"},
@@ -219,13 +230,15 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             logger.info("🔓 Cabinet unlocked")
         
         elif self.path == '/api/simulate/lock':
-            # Simulate lock
+            # Simulate lock - but KEEP session for potential scan
+            # In real cabinet, lock happens after scan, but for testing
+            # we allow lock -> scan flow where scan uses existing session
             state["current_state"] = "LOCKED"
-            state["current_session"] = None
-            state["current_user"] = None
+            # Don't clear session/user here - scan needs them
+            # They will be cleared when new auth happens
             self._set_headers()
             self.wfile.write(json.dumps({"success": True, "state": "LOCKED"}).encode())
-            logger.info("🔒 Cabinet locked")
+            logger.info("🔒 Cabinet locked (session preserved for scan)")
         
         elif self.path == '/api/simulate/scan':
             # Simulate RFID scan
@@ -234,12 +247,20 @@ class TestAPIHandler(BaseHTTPRequestHandler):
             
             if not session_id:
                 self._set_headers(400)
-                self.wfile.write(json.dumps({"error": "No active session"}).encode())
+                self.wfile.write(json.dumps({"error": "No active session. Please authenticate first."}).encode())
                 return
             
-            # Simulate detected RFID tags
-            # Scenario: User takes RFID-OSC-002 and returns RFID-MUL-001
-            detected_tags = ["RFID-OSC-001", "RFID-OSC-003", "RFID-MUL-001", "RFID-MUL-002"]
+            # Get detected tags from request or use default scenario
+            # Scenario: User takes RFID-OSC-002 (borrow) and returns RFID-MUL-001 (return)
+            # So OSC-002 is GONE, MUL-001 is PRESENT
+            detected_tags = body.get('rfids', [
+                "RFID-OSC-001",  # Still here
+                # "RFID-OSC-002",  # BORROWED - not present
+                "RFID-OSC-003",  # Still here
+                "RFID-TOOL-001", # Still here
+                "RFID-MUL-001",  # RETURNED - now present!
+                "RFID-MUL-002",  # Still here
+            ])
             
             # Save snapshot
             db.save_rfid_snapshot(session_id, 1, detected_tags)
