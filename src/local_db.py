@@ -4,7 +4,7 @@ import sqlite3
 import json
 import logging
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set, Tuple
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ class LocalDB:
             expires_at TIMESTAMP
         );
         
-        -- Item state cache
+        -- Item state cache (knows which user holds each item)
         CREATE TABLE IF NOT EXISTS item_cache (
             rfid_tag TEXT PRIMARY KEY,
             item_id TEXT NOT NULL,
@@ -48,13 +48,37 @@ class LocalDB:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
-        -- Pending sync sessions
-        CREATE TABLE IF NOT EXISTS pending_sync (
+        -- RFID snapshots (for local diff calculation)
+        CREATE TABLE IF NOT EXISTS rfid_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
+            cabinet_id INTEGER NOT NULL,
+            rfid_tag TEXT NOT NULL,
+            present BOOLEAN NOT NULL,
+            captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        -- Session diff results (for immediate display)
+        CREATE TABLE IF NOT EXISTS session_diffs (
+            session_id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            borrowed TEXT,  -- JSON array
+            returned TEXT,  -- JSON array
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            synced BOOLEAN DEFAULT FALSE,
+            synced_at TIMESTAMP
+        );
+        
+        -- Pending sync sessions (with idempotency check)
+        CREATE TABLE IF NOT EXISTS pending_sync (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL UNIQUE,  -- UNIQUE prevents duplicates
             user_id TEXT NOT NULL,
             rfids TEXT,  -- JSON array
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            retry_count INTEGER DEFAULT 0,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_attempt TIMESTAMP
         );
         
         -- Access logs
@@ -70,6 +94,9 @@ class LocalDB:
         -- Create indexes
         CREATE INDEX IF NOT EXISTS idx_auth_expires ON auth_cache(expires_at);
         CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_sync(created_at);
+        CREATE INDEX IF NOT EXISTS idx_pending_session ON pending_sync(session_id);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_session ON rfid_snapshots(session_id);
+        CREATE INDEX IF NOT EXISTS idx_diffs_session ON session_diffs(session_id);
         '''
         
         self._conn.executescript(schema)
@@ -111,20 +138,139 @@ class LocalDB:
             }
         return None
     
-    def queue_sync_session(self, session_id: str, user_id: str, rfids: List[str]):
-        """Queue session for later sync."""
+    def save_rfid_snapshot(self, session_id: str, cabinet_id: int, rfids: List[str]):
+        """Save RFID snapshot for session (marks end of session)."""
+        with self._conn:
+            # Save all present tags
+            for tag in rfids:
+                self._conn.execute('''
+                    INSERT INTO rfid_snapshots (session_id, cabinet_id, rfid_tag, present)
+                    VALUES (?, ?, ?, ?)
+                ''', (session_id, cabinet_id, tag, True))
+        logger.info(f"Saved RFID snapshot: {len(rfids)} tags for session {session_id[:8]}")
+    
+    def get_last_snapshot(self, cabinet_id: int, before_session: Optional[str] = None) -> Set[str]:
+        """Get RFID tags from last session for this cabinet."""
+        query = '''
+            SELECT rfid_tag FROM rfid_snapshots 
+            WHERE cabinet_id = ? AND session_id != ?
+            AND captured_at = (
+                SELECT MAX(captured_at) FROM rfid_snapshots 
+                WHERE cabinet_id = ? AND session_id != ?
+            )
+        '''
+        rows = self._conn.execute(query, (cabinet_id, before_session or '', cabinet_id, before_session or '')).fetchall()
+        return set(row['rfid_tag'] for row in rows)
+    
+    def calculate_diff(self, current_rfids: List[str], cabinet_id: int, user_id: str) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Calculate diff between current RFID scan and last snapshot.
+        Returns: (borrowed_items, returned_items)
+        """
+        current_set = set(current_rfids)
+        last_set = self.get_last_snapshot(cabinet_id)
+        
+        # Items that disappeared = borrowed by this user
+        borrowed_tags = last_set - current_set
+        # Items that appeared = returned by this user  
+        returned_tags = current_set - last_set
+        
+        borrowed = []
+        returned = []
+        
+        # Lookup item details from cache
+        for tag in borrowed_tags:
+            item = self._conn.execute(
+                'SELECT * FROM item_cache WHERE rfid_tag = ?', (tag,)
+            ).fetchone()
+            if item:
+                borrowed.append({
+                    'rfid': tag,
+                    'item_id': item['item_id'],
+                    'name': item['name'] or f'Item {tag}'
+                })
+                # Update cache: now held by this user
+                self.update_item_state(tag, 'BORROWED', user_id)
+        
+        for tag in returned_tags:
+            item = self._conn.execute(
+                'SELECT * FROM item_cache WHERE rfid_tag = ?', (tag,)
+            ).fetchone()
+            if item:
+                returned.append({
+                    'rfid': tag,
+                    'item_id': item['item_id'],
+                    'name': item['name'] or f'Item {tag}'
+                })
+                # Update cache: now available
+                self.update_item_state(tag, 'AVAILABLE', None)
+        
+        return borrowed, returned
+    
+    def save_session_diff(self, session_id: str, user_id: str, borrowed: List[Dict], returned: List[Dict]):
+        """Save calculated diff for immediate display."""
         with self._conn:
             self._conn.execute('''
-                INSERT INTO pending_sync (session_id, user_id, rfids)
-                VALUES (?, ?, ?)
-            ''', (session_id, user_id, json.dumps(rfids)))
-        logger.info(f"Queued session {session_id[:8]} for sync")
+                INSERT OR REPLACE INTO session_diffs 
+                (session_id, user_id, borrowed, returned, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                session_id, user_id,
+                json.dumps(borrowed), json.dumps(returned),
+                datetime.now()
+            ))
+        logger.info(f"Saved session diff: {len(borrowed)} borrowed, {len(returned)} returned")
+    
+    def get_session_diff(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get session diff for display."""
+        row = self._conn.execute(
+            'SELECT * FROM session_diffs WHERE session_id = ?', (session_id,)
+        ).fetchone()
+        
+        if row:
+            return {
+                'session_id': row['session_id'],
+                'user_id': row['user_id'],
+                'borrowed': json.loads(row['borrowed']),
+                'returned': json.loads(row['returned']),
+                'created_at': row['created_at'],
+                'synced': row['synced']
+            }
+        return None
+    
+    def mark_diff_synced(self, session_id: str):
+        """Mark diff as synced after successful API call."""
+        with self._conn:
+            self._conn.execute('''
+                UPDATE session_diffs 
+                SET synced = TRUE, synced_at = ?
+                WHERE session_id = ?
+            ''', (datetime.now(), session_id))
+    
+    def queue_sync_session(self, session_id: str, user_id: str, rfids: List[str]) -> bool:
+        """
+        Queue session for later sync.
+        Returns False if already queued (idempotency).
+        """
+        try:
+            with self._conn:
+                self._conn.execute('''
+                    INSERT INTO pending_sync (session_id, user_id, rfids)
+                    VALUES (?, ?, ?)
+                ''', (session_id, user_id, json.dumps(rfids)))
+            logger.info(f"Queued session {session_id[:8]} for sync")
+            return True
+        except sqlite3.IntegrityError:
+            # Already queued - idempotency
+            logger.info(f"Session {session_id[:8]} already queued, skipping")
+            return False
     
     def get_pending_sync(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get pending sync sessions."""
+        """Get pending sync sessions ordered by retry count (least retries first)."""
         rows = self._conn.execute('''
             SELECT * FROM pending_sync 
-            ORDER BY created_at ASC LIMIT ?
+            ORDER BY retry_count ASC, created_at ASC
+            LIMIT ?
         ''', (limit,)).fetchall()
         
         return [{
@@ -132,13 +278,40 @@ class LocalDB:
             'session_id': row['session_id'],
             'user_id': row['user_id'],
             'rfids': json.loads(row['rfids']),
+            'retry_count': row['retry_count'],
             'created_at': row['created_at'],
+            'last_attempt': row['last_attempt'],
         } for row in rows]
+    
+    def mark_sync_attempt(self, sync_id: int, error: Optional[str] = None):
+        """Record sync attempt, increment retry count on failure."""
+        with self._conn:
+            if error:
+                self._conn.execute('''
+                    UPDATE pending_sync 
+                    SET retry_count = retry_count + 1, 
+                        last_error = ?, 
+                        last_attempt = ?
+                    WHERE id = ?
+                ''', (error, datetime.now(), sync_id))
+            else:
+                self._conn.execute('''
+                    UPDATE pending_sync 
+                    SET last_attempt = ?
+                    WHERE id = ?
+                ''', (datetime.now(), sync_id))
     
     def remove_pending_sync(self, sync_id: int):
         """Remove processed sync from queue."""
         with self._conn:
             self._conn.execute('DELETE FROM pending_sync WHERE id = ?', (sync_id,))
+    
+    def is_session_synced(self, session_id: str) -> bool:
+        """Check if session has already been synced."""
+        row = self._conn.execute(
+            'SELECT 1 FROM pending_sync WHERE session_id = ?', (session_id,)
+        ).fetchone()
+        return row is None
     
     def log_access(self, card_uid: Optional[str], user_id: Optional[str],
                    session_id: Optional[str] = None, tags_found: Optional[List[str]] = None):
@@ -156,6 +329,22 @@ class LocalDB:
                 INSERT OR REPLACE INTO item_cache (rfid_tag, status, holder_id, updated_at)
                 VALUES (?, ?, ?, ?)
             ''', (rfid_tag, status, holder_id, datetime.now()))
+    
+    def get_item_cache(self, rfid_tag: str) -> Optional[Dict[str, Any]]:
+        """Get cached item info."""
+        row = self._conn.execute(
+            'SELECT * FROM item_cache WHERE rfid_tag = ?', (rfid_tag,)
+        ).fetchone()
+        
+        if row:
+            return {
+                'rfid_tag': row['rfid_tag'],
+                'item_id': row['item_id'],
+                'name': row['name'],
+                'status': row['status'],
+                'holder_id': row['holder_id']
+            }
+        return None
     
     def close(self):
         """Close database connection."""

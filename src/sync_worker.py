@@ -41,28 +41,61 @@ class SyncWorker(threading.Thread):
         """Check server connectivity."""
         try:
             self._online = self.api.health_check()
+            if self._online:
+                logger.debug("Server is online")
         except Exception:
             self._online = False
     
     def _sync_pending(self):
-        """Process pending sync queue."""
+        """Process pending sync queue with idempotency."""
         pending = self.local_db.get_pending_sync(limit=10)
         
+        if not pending:
+            return
+        
+        logger.info(f"Processing {len(pending)} pending syncs")
+        
         for item in pending:
+            session_id = item['session_id']
+            
             try:
+                # Idempotency check: skip if already synced via another path
+                if self.local_db.is_session_synced(session_id):
+                    logger.debug(f"Session {session_id[:8]} already synced, removing from queue")
+                    self.local_db.remove_pending_sync(item['id'])
+                    continue
+                
+                # Mark attempt
+                self.local_db.mark_sync_attempt(item['id'])
+                
+                # Call API
                 result = self.api.sync_session(
-                    session_id=item['session_id'],
+                    session_id=session_id,
                     cabinet_id=1,  # TODO: get from config
                     user_id=item['user_id'],
                     rfids=item['rfids']
                 )
                 
+                # Success - remove from queue
                 self.local_db.remove_pending_sync(item['id'])
-                logger.info(f"Synced session {item['session_id'][:8]}")
+                
+                # Mark diff as synced too
+                self.local_db.mark_diff_synced(session_id)
+                
+                logger.info(f"Synced session {session_id[:8]}: "
+                           f"{len(result.get('borrowed', []))} borrowed, "
+                           f"{len(result.get('returned', []))} returned")
                 
             except Exception as e:
-                logger.warning(f"Failed to sync {item['session_id'][:8]}: {e}")
-                break  # Stop on first failure
+                error_msg = str(e)
+                logger.warning(f"Failed to sync {session_id[:8]}: {error_msg}")
+                
+                # Record failure for retry tracking
+                self.local_db.mark_sync_attempt(item['id'], error=error_msg)
+                
+                # Stop processing more items if this one failed
+                # (likely network issue, retry later)
+                break
     
     def is_online(self) -> bool:
         """Check if server is online."""

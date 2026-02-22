@@ -8,6 +8,7 @@ import time
 import signal
 import sys
 import logging
+import uuid
 from pathlib import Path
 
 # Add src to path
@@ -15,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from state_machine import StateMachine, SystemState
 from hardware.controller import HardwareController
-from api_client import APIClient
+from api_client import APIClient, APIError
 from local_db import LocalDB
 from sync_worker import SyncWorker
 from config import CONFIG
@@ -74,6 +75,11 @@ class SmartCabinet:
         self.state_machine.on_enter(SystemState.UNLOCKED, self._on_unlocked)
         self.state_machine.on_enter(SystemState.SCANNING, self._on_scanning)
     
+    def _send_to_display(self, message: dict):
+        """Send update to local dashboard (placeholder for WebSocket)."""
+        # TODO: Implement WebSocket to Electron display
+        logger.info(f"[DISPLAY] {message['type']}: {message}")
+    
     def _on_locked(self):
         """Handle LOCKED state entry."""
         logger.info("State: LOCKED")
@@ -82,11 +88,21 @@ class SmartCabinet:
         self.current_user_id = None
         self.current_card_uid = None
         self.session_id = None
+        
+        self._send_to_display({
+            'type': 'STATE_CHANGE',
+            'state': 'LOCKED'
+        })
     
     def _on_authenticating(self):
         """Handle AUTHENTICATING state entry."""
         logger.info("State: AUTHENTICATING")
         self.hardware.set_all_leds('yellow')
+        
+        self._send_to_display({
+            'type': 'STATE_CHANGE',
+            'state': 'AUTHENTICATING'
+        })
         
         # Read NFC/QR
         card_uid = self.hardware.read_nfc_or_qr(timeout=30)
@@ -102,13 +118,29 @@ class SmartCabinet:
         if result['authorized']:
             self.current_card_uid = card_uid
             self.current_user_id = result['user_id']
-            self.session_id = result['session_id']
+            self.session_id = str(uuid.uuid4())  # Generate session ID now
             logger.info(f"Authenticated: {result['user_name']} ({self.current_user_id})")
+            
+            self._send_to_display({
+                'type': 'AUTH_SUCCESS',
+                'user': {
+                    'id': self.current_user_id,
+                    'email': result.get('email', ''),
+                    'full_name': result.get('user_name', '')
+                }
+            })
+            
             self.state_machine.transition(SystemState.UNLOCKED)
         else:
-            logger.warning(f"Authentication failed: {result.get('reason', 'Unknown')}")
+            logger.warning(f"Authentication failed: {result.get('reason')}")
             self.hardware.set_all_leds('red')
             self.hardware.beep_error()
+            
+            self._send_to_display({
+                'type': 'AUTH_FAILURE',
+                'error': result.get('reason', 'Access denied')
+            })
+            
             time.sleep(2)
             self.state_machine.transition(SystemState.LOCKED)
     
@@ -140,6 +172,12 @@ class SmartCabinet:
         self.hardware.beep_success()
         
         unlock_time = time.time()
+        
+        self._send_to_display({
+            'type': 'STATE_CHANGE',
+            'state': 'UNLOCKED',
+            'session_id': self.session_id
+        })
         
         # Wait for user to close cabinet
         while self.running and (time.time() - unlock_time) < CONFIG['session_timeout']:
@@ -175,21 +213,61 @@ class SmartCabinet:
         self.hardware.set_all_leds('yellow')
         self.hardware.lock_all()
         
+        self._send_to_display({
+            'type': 'STATE_CHANGE',
+            'state': 'SCANNING'
+        })
+        
         # Perform RFID scan
         tags = self._scan_rfid()
         logger.info(f"RFID scan complete: {len(tags)} tags found")
         
-        # Sync with server
-        if self.current_user_id and self.session_id:
-            self._sync_session(tags)
+        # Save snapshot for this session
+        self.local_db.save_rfid_snapshot(
+            self.session_id, CONFIG['cabinet_id'], tags
+        )
+        
+        # Calculate diff locally (immediate feedback)
+        borrowed, returned = self.local_db.calculate_diff(
+            tags, CONFIG['cabinet_id'], self.current_user_id
+        )
+        
+        logger.info(f"Local diff: {len(borrowed)} borrowed, {len(returned)} returned")
+        
+        # Save diff for display
+        self.local_db.save_session_diff(
+            self.session_id, self.current_user_id, borrowed, returned
+        )
+        
+        # IMMEDIATE feedback to user (before sync)
+        self._send_to_display({
+            'type': 'ITEM_SUMMARY',
+            'itemSummary': {
+                'borrowed': borrowed,
+                'returned': returned
+            }
+        })
+        
+        # Try to sync with server (best effort)
+        sync_success = self._try_sync_session(tags, borrowed, returned)
+        
+        if not sync_success:
+            # Queue for later if sync failed
+            self.local_db.queue_sync_session(
+                self.session_id, self.current_user_id, tags
+            )
+            logger.info(f"Session {self.session_id[:8]} queued for later sync")
         
         # Log access
         self.local_db.log_access(
             card_uid=self.current_card_uid,
             user_id=self.current_user_id,
+            session_id=self.session_id,
             tags_found=tags
         )
         
+        # Wait a moment for user to see summary, then return to locked
+        time.sleep(10)  # Show summary for 10 seconds
         self.state_machine.transition(SystemState.LOCKED)
     
     def _scan_rfid(self) -> list:
@@ -204,14 +282,14 @@ class SmartCabinet:
         
         return sorted(list(all_tags))
     
-    def _sync_session(self, tags: list):
-        """Sync RFID scan with server."""
+    def _try_sync_session(self, tags: list, borrowed: list, returned: list) -> bool:
+        """
+        Try to sync session with server.
+        Returns True if successful, False if should queue for later.
+        """
         if not self.sync_worker.is_online():
-            logger.warning("Offline, queueing for later sync")
-            self.local_db.queue_sync_session(
-                self.session_id, self.current_user_id, tags
-            )
-            return
+            logger.warning("Offline, will retry later")
+            return False
         
         try:
             result = self.api.sync_session(
@@ -221,21 +299,27 @@ class SmartCabinet:
                 rfids=tags
             )
             
-            logger.info(f"Sync result: {len(result.get('borrowed', []))} borrowed, "
-                       f"{len(result.get('returned', []))} returned")
+            # Validate server result matches local calculation
+            server_borrowed = len(result.get('borrowed', []))
+            server_returned = len(result.get('returned', []))
+            local_borrowed = len(borrowed)
+            local_returned = len(returned)
             
-            # Update local item states
-            for item in result.get('borrowed', []):
-                self.local_db.update_item_state(item['rfid'], 'BORROWED', self.current_user_id)
+            if server_borrowed == local_borrowed and server_returned == local_returned:
+                logger.info(f"Sync confirmed: {server_borrowed} borrowed, {server_returned} returned")
+            else:
+                logger.warning(f"Sync mismatch - Server: {server_borrowed}/{server_returned}, Local: {local_borrowed}/{local_returned}")
             
-            for item in result.get('returned', []):
-                self.local_db.update_item_state(item['rfid'], 'AVAILABLE', None)
-                
-        except Exception as e:
+            # Mark as synced
+            self.local_db.mark_diff_synced(self.session_id)
+            return True
+            
+        except APIError as e:
             logger.error(f"Sync failed: {e}")
-            self.local_db.queue_sync_session(
-                self.session_id, self.current_user_id, tags
-            )
+            return False
+        except Exception as e:
+            logger.exception(f"Unexpected sync error: {e}")
+            return False
     
     def run(self):
         """Main loop."""
@@ -260,6 +344,9 @@ class SmartCabinet:
                 
                 time.sleep(0.1)
                 
+        except KeyboardInterrupt:
+            logger.info("\nUser interrupt")
+            self.running = False
         except Exception as e:
             logger.exception("Fatal error in main loop")
         finally:
