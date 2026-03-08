@@ -1,9 +1,19 @@
 {
-  "server_url": "http://100.83.123.68:3000",
+  "server_url": "https://save4223.local:8443",
   "edge_secret": "edge_device_secret_key",
   "cabinet_id": 1,
   "db_path": "/home/pi/cabinet/data/local.db",
   "session_timeout": 30,
   "rfid_scan_count": 10,
-  "sync_interval": 60
+  "sync_interval": 60,
+  "ssl": {
+    "verify": true,
+    "cert_path": "/home/pi/cabinet/ssl/server.crt",
+    "disable_warning": false
+  },
+  "api": {
+    "timeout": 5,
+    "max_retries": 3,
+    "retry_delay": 1.0
+  }
 }
