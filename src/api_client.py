@@ -152,22 +152,43 @@ class APIClient:
         
         return result
     
-    def sync_session(self, session_id: str, cabinet_id: int, 
-                     user_id: str, rfids: list) -> Dict[str, Any]:
+    def sync_session(self, session_id: str, cabinet_id: int,
+                     user_id: str, start_rfids: list = None,
+                     end_rfids: list = None, evidence_image: str = None) -> Dict[str, Any]:
         """
         Sync RFID scan results with server.
-        
+
+        Server calculates BORROW/RETURN by diffing start_rfids and end_rfids.
+
         POST /api/edge/sync-session
+
+        Args:
+            session_id: Unique session identifier
+            cabinet_id: Cabinet identifier
+            user_id: User identifier
+            start_rfids: RFID tags present when cabinet was unlocked
+            end_rfids: RFID tags present when cabinet was locked
+            evidence_image: Optional base64-encoded image
+
+        Returns:
+            Server response with transaction details
         """
-        logger.debug(f"Syncing session: {session_id[:8]}... with {len(rfids)} tags")
-        
-        result = self._request('POST', '/api/edge/sync-session', json={
+        logger.debug(f"Syncing session: {session_id[:8]}...")
+        logger.debug(f"  Start: {len(start_rfids or [])} tags, End: {len(end_rfids or [])} tags")
+
+        payload = {
             'session_id': session_id,
             'cabinet_id': cabinet_id,
             'user_id': user_id,
-            'rfids_present': rfids,
-        })
-        
+            'start_rfids': start_rfids or [],
+            'end_rfids': end_rfids or [],
+        }
+
+        if evidence_image:
+            payload['evidence_image'] = evidence_image
+
+        result = self._request('POST', '/api/edge/sync-session', json=payload)
+
         return result
     
     def local_sync(self, cabinet_id: int) -> Dict[str, Any]:

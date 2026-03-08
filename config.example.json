@@ -3,17 +3,41 @@
   "edge_secret": "edge_device_secret_key",
   "cabinet_id": 1,
   "db_path": "/home/pi/cabinet/data/local.db",
-  "session_timeout": 30,
+  "session_timeout": 300,
   "rfid_scan_count": 10,
   "sync_interval": 60,
+  "num_drawers": 4,
   "ssl": {
     "verify": true,
     "cert_path": "/home/pi/cabinet/ssl/server.crt",
     "disable_warning": false
   },
   "api": {
-    "timeout": 5,
+    "timeout": 10,
     "max_retries": 3,
     "retry_delay": 1.0
+  },
+  "hardware": {
+    "mode": "mock",
+    "nfc": {
+      "type": "pn532",
+      "interface": "spi",
+      "port": 0
+    },
+    "rfid": {
+      "type": "rc522",
+      "ports": [0, 1, 2, 3],
+      "multiplexer": true
+    },
+    "servo": {
+      "type": "pca9685",
+      "i2c_address": "0x40",
+      "frequency": 50
+    },
+    "led": {
+      "type": "ws2812",
+      "count": 8,
+      "pin": 18
+    }
   }
 }
